@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 nonogram-solver-core = { path = "../solver-core" }
+tauri-plugin-fs = "2.4.5"

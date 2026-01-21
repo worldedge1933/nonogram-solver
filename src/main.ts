@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { open as shellOpen } from '@tauri-apps/plugin-shell';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { readTextFile } from '@tauri-apps/plugin-fs';
 
 type Lang = 'zh' | 'en';
 
@@ -47,6 +49,19 @@ const i18n = {
     langToggle: 'English',
     githubLinkLabel: 'GitHub 仓库',
     issuesLinkLabel: '问题反馈',
+    loadFromFile: '从文件读取线索',
+    selectPuzzleFile: '选择数织线索文件',
+    fileSelected: (filename: string) => `已选择文件：${filename}`,
+    fileOpenError: (error: string) => `无法打开文件选择器：${error}`,
+    textFiles: '文本文件',
+    allFiles: '所有文件',
+    puzzleLoaded: ({ rows, cols }: { rows: number; cols: number }) => `成功加载 ${rows}×${cols} 谜题`,
+    fileEmpty: '文件为空',
+invalidRowNum: '无效的 rowNum 值',
+invalidColNum: '无效的 colNum 值',
+missingRowOrColNum: '文件必须包含有效的 rowNum 和 colNum',
+rowCluesInsufficient: (params: { needed: number }) => `行线索不足：需要 ${params.needed} 行`,
+colCluesInsufficient: (params: { needed: number }) => `列线索不足：需要 ${params.needed} 行`,
   },
   en: {
     appTitle: 'Nonogram Solver',
@@ -83,6 +98,19 @@ const i18n = {
     langToggle: '中文',
     githubLinkLabel: 'GitHub Repo',
     issuesLinkLabel: 'Issues',
+    loadFromFile: 'Load clues from File',
+    selectPuzzleFile: 'Select Nonogram Clue File',
+    fileSelected: (filename: string) => `File selected: ${filename}`,
+    fileOpenError: (error: string) => `Failed to open file dialog: ${error}`,
+    textFiles: 'Text files',
+    allFiles: 'All files',
+    puzzleLoaded: ({ rows, cols }: { rows: number; cols: number }) => `Loaded ${rows}×${cols} puzzle`,
+    fileEmpty: 'File is empty',
+invalidRowNum: 'Invalid rowNum value',
+invalidColNum: 'Invalid colNum value',
+missingRowOrColNum: 'File must contain valid rowNum and colNum',
+rowCluesInsufficient: (params: { needed: number }) => `Row clues insufficient: need ${params.needed} lines`,
+colCluesInsufficient: (params: { needed: number }) => `Column clues insufficient: need ${params.needed} lines`,
   },
 } as const;
 
@@ -351,7 +379,43 @@ function renderEditor() {
       td.style.minHeight = td.style.height;
       td.style.maxHeight = td.style.height;
       td.style.boxSizing = 'border-box';
-      td.style.border = `1px solid ${cellBorder(v)}`;
+      td.style.background = cellBg(v);
+      td.style.cursor = 'pointer';
+      td.title = v === 2 ? t('cellUnknown') : v === 1 ? t('cellFilled') : t('cellEmpty');
+
+      const baseColor = cellBorder(v);
+      const THICK_BORDER = '3px';   // ← 修改这里即可全局调整粗线宽度
+      const THIN_BORDER = '1px';
+
+      // 是否是最后一行 / 最后一列
+      const isLastRow = r === state.rows - 1;
+      const isLastCol = c === state.cols - 1;
+
+      // Top: 第一行 or 上方是分组线（其实只需第一行有 top）
+      td.style.borderTop = r === 0 ? `${THICK_BORDER} solid ${baseColor}` : 'none';
+
+      // Left: 第一列
+      td.style.borderLeft = c === 0 ? `${THICK_BORDER} solid ${baseColor}` : 'none';
+
+      // Right: 每5列分组线 OR 最后一列（确保右边界闭合）
+      td.style.borderRight = (isLastCol || (c + 1) % 5 === 0)
+        ? `${THICK_BORDER} solid ${baseColor}`
+        : `${THIN_BORDER} solid ${baseColor}`;
+
+      // Bottom: 每5行分组线 OR 最后一行（确保下边界闭合）
+      td.style.borderBottom = (isLastRow || (r + 1) % 5 === 0)
+        ? `${THICK_BORDER} solid ${baseColor}`
+        : `${THIN_BORDER} solid ${baseColor}`;
+
+      // Click handler
+      td.addEventListener('click', () => {
+        invalidateSolveResult();
+        const cur = state.knownGrid[r][c];
+        const next = cur === 2 ? 1 : cur === 1 ? 0 : 2;
+        state.knownGrid[r][c] = next;
+        renderEditor();
+      });
+
       td.style.background = cellBg(v);
       td.style.cursor = 'pointer';
       td.title = v === 2 ? t('cellUnknown') : v === 1 ? t('cellFilled') : t('cellEmpty');
@@ -370,6 +434,73 @@ function renderEditor() {
 
   editorEl.innerHTML = '';
   editorEl.appendChild(table);
+}
+
+function parsePuzzleFile(content: string): {
+  rows: number;
+  cols: number;
+  rowCluesText: string[];
+  colCluesText: string[];
+} {
+  const lines = content
+    .split('\n')
+    .map(line => line.trim()); 
+
+  if (lines.length === 0) {
+    throw new Error(t('fileEmpty'));
+  }
+
+  let rows = -1;
+  let cols = -1;
+  let rowCluesStart = -1;
+  let colCluesStart = -1;
+
+  // 第一步：扫描前若干行，找到 rowNum 和 colNum 的位置
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith('rowNum:')) {
+      rows = parseInt(line.substring(7), 10);
+      if (isNaN(rows) || rows <= 0) {
+        throw new Error(t('invalidRowNum'));
+      }
+      rowCluesStart = i + 1;
+    } else if (line.startsWith('colNum:')) {
+      cols = parseInt(line.substring(7), 10);
+      if (isNaN(cols) || cols <= 0) {
+        throw new Error(t('invalidColNum'));
+      }
+      colCluesStart = i + 1;
+    }
+
+    // 如果两个维度都找到了，可以提前退出
+    if (rows > 0 && cols > 0) break;
+  }
+
+  if (rows <= 0 || cols <= 0) {
+    throw new Error(t('missingRowOrColNum'));
+  }
+
+  // 第二步：根据起始位置提取线索文本
+  const rowCluesText: string[] = [];
+  const colCluesText: string[] = [];
+
+  // 提取行线索：从 rowCluesStart 开始取 rows 行
+  if (rowCluesStart === -1 || rowCluesStart + rows > lines.length) {
+    throw new Error(t('rowCluesInsufficient')({ needed: rows }));
+  }
+  for (let i = 0; i < rows; i++) {
+    rowCluesText.push(lines[rowCluesStart + i]);
+  }
+
+  // 提取列线索：从 colCluesStart 开始取 cols 行
+  if (colCluesStart === -1 || colCluesStart + cols > lines.length) {
+    throw new Error(t('colCluesInsufficient')({ needed: cols }));
+  }
+  for (let i = 0; i < cols; i++) {
+    colCluesText.push(lines[colCluesStart + i]);
+  }
+
+  return { rows, cols, rowCluesText, colCluesText };
 }
 
 const editing: { kind: 'row' | 'col' | null; index: number } = { kind: null, index: -1 };
@@ -439,6 +570,10 @@ function mountUI() {
           <div id="clueHint" style="min-width: 140px; font-size:12px; color:#374151;">${t('clueHintDefault')}</div>
           <input id="clueInput" type="text" placeholder="${t('cluePlaceholder')}" style="width: 270px; padding:6px 8px; height:32px; box-sizing:border-box;" disabled />
         </div>
+        <div style="margin-top: 6px;">
+          <button id="loadFromFile" style="height:32px; padding:0 12px;">${t('loadFromFile')}</button>
+          <span id="fileLoadStatus" style="margin-left: 12px; font-size:13px; color:#374151;"></span>
+        </div>
         <div style="color:#6b7280; margin-bottom:12px; margin-top:12px; font-size: 13px;">${t('instructions')}</div>
         <div style="margin-top:6px; font-size:12px; color:#6b7280;">${t('navHint')}</div>
       </div>
@@ -483,6 +618,8 @@ function mountUI() {
   editorEl = document.getElementById('editor') as HTMLDivElement;
   clueHintEl = document.getElementById('clueHint') as HTMLDivElement;
   clueInputEl = document.getElementById('clueInput') as HTMLInputElement;
+  const loadFromFileBtn = document.getElementById('loadFromFile') as HTMLButtonElement;
+  const fileLoadStatusEl = document.getElementById('fileLoadStatus') as HTMLSpanElement;
 
   langToggleBtn.addEventListener('click', () => {
     lang = lang === 'zh' ? 'en' : 'zh';
@@ -562,6 +699,62 @@ function mountUI() {
       statusEl.textContent = String(e);
     }
   });
+
+  loadFromFileBtn.addEventListener('click', async () => {
+    // 清空前一次状态
+    fileLoadStatusEl.textContent = '';
+
+    try {
+      const selected = await openDialog({
+        filters: [
+          { name: t('textFiles'), extensions: ['txt'] },
+          { name: t('allFiles'), extensions: ['*'] }
+        ],
+        multiple: false,
+        title: t('selectPuzzleFile')
+      });
+
+      if (selected === null) return;
+
+      const filePath = selected as string;
+      const filename = filePath.split(/[\\/]/).pop() || filePath;
+
+      // 显示“已选择”状态
+      fileLoadStatusEl.textContent = t('fileSelected')(filename);
+
+      // 读取并解析文件内容
+      const content = await readTextFile(filePath);
+      const puzzle = parsePuzzleFile(content);
+
+    // 5. 更新全局状态
+    state.rows = puzzle.rows;
+    state.cols = puzzle.cols;
+    state.rowClueText = puzzle.rowCluesText; // 直接赋值字符串数组
+    state.colClueText = puzzle.colCluesText;
+    state.knownGrid = createGrid(puzzle.rows, puzzle.cols, 2);
+    state.solvedGrid = null;
+
+    // 6. 同步输入框值
+    rowsInput.value = String(puzzle.rows);
+    colsInput.value = String(puzzle.cols);
+
+    // 7. 刷新编辑器
+    renderEditor();
+    setPuzzleStatus('');
+
+    // 8. 显示成功消息
+    fileLoadStatusEl.style.color = '#10b981';
+    fileLoadStatusEl.textContent = t('puzzleLoaded')({ rows: puzzle.rows, cols: puzzle.cols });
+
+
+    } catch (err) {
+      console.error('打开文件选择器失败:', err);
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      fileLoadStatusEl.textContent = t('fileOpenError')(errorMsg);
+      fileLoadStatusEl.style.color = '#ef4444'; // 红色表示错误
+    }
+  });
+
 
   renderEditor();
   setPuzzleStatus('');
